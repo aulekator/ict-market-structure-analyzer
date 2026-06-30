@@ -1,0 +1,322 @@
+//@version=5
+indicator("AULE KATOR", overlay=true, precision=3)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+show_ipda       = input.bool(true,  "Show 20-Day IPDA Range")
+show_pdh_pdl    = input.bool(true,  "Show PDH / PDL Levels")
+show_killzones  = input.bool(true,  "Show Kill Zones")
+show_table      = input.bool(true,  "Show Bias Table")
+ipda_days       = input.int(20,     "IPDA Lookback Days", minval=10, maxval=60)
+eq_lookback     = input.int(20,     "Equal Highs/Lows Lookback", minval=5, maxval=60)
+eq_tolerance    = input.float(0.1,  "Equal High/Low Tolerance %", minval=0.01, step=0.01) / 100.0
+
+// ============================================================================
+// STEP 1 — 20-DAY IPDA RANGE
+// ============================================================================
+ipda_high = request.security(syminfo.tickerid, "D", ta.highest(high, ipda_days))
+ipda_low  = request.security(syminfo.tickerid, "D", ta.lowest(low, ipda_days))
+
+ipda_mid       = (ipda_high + ipda_low) / 2
+ipda_range     = ipda_high - ipda_low
+price_position = (close - ipda_low) / ipda_range * 100
+
+is_premium  = close > ipda_mid
+is_discount = close <= ipda_mid
+
+// ============================================================================
+// STEP 2 — PREVIOUS DAY HIGH / LOW
+// ============================================================================
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+dist_to_pdh = math.abs(pdh - close)
+dist_to_pdl = math.abs(close - pdl)
+
+// ============================================================================
+// STEP 3 — WEEKLY BIAS
+// ============================================================================
+weekly_high1 = request.security(syminfo.tickerid, "W", high[1])
+weekly_low1  = request.security(syminfo.tickerid, "W", low[1])
+weekly_high2 = request.security(syminfo.tickerid, "W", high[2])
+weekly_low2  = request.security(syminfo.tickerid, "W", low[2])
+
+weekly_bullish = weekly_high1 > weekly_high2 and weekly_low1 > weekly_low2
+weekly_bearish = weekly_high1 < weekly_high2 and weekly_low1 < weekly_low2
+
+// ============================================================================
+// STEP 3.5 — EQUAL HIGHS / EQUAL LOWS (Untouched Liquidity Pools)
+// ============================================================================
+d_highs = request.security(syminfo.tickerid, "D", high, lookahead=barmerge.lookahead_off)
+d_lows  = request.security(syminfo.tickerid, "D", low,  lookahead=barmerge.lookahead_off)
+
+var bool has_bsl = false
+var bool has_ssl = false
+var float nearest_eqh = na
+var float nearest_eql = na
+
+// Reset and recalculate on each bar
+if barstate.isrealtime or barstate.isconfirmed
+    has_bsl := false
+    has_ssl := false
+    nearest_eqh := na
+    nearest_eql := na
+    
+    // Check for equal highs above current price
+    for i = 1 to eq_lookback
+        for j = i + 1 to eq_lookback + 1
+            hi = d_highs[i]
+            hj = d_highs[j]
+            if not na(hi) and not na(hj)
+                if math.abs(hi - hj) / hi < eq_tolerance
+                    level = (hi + hj) / 2
+                    if level > close
+                        has_bsl := true
+                        if na(nearest_eqh) or math.abs(level - close) < math.abs(nearest_eqh - close)
+                            nearest_eqh := level
+            
+            lo = d_lows[i]
+            loj = d_lows[j]
+            if not na(lo) and not na(loj)
+                if math.abs(lo - loj) / lo < eq_tolerance
+                    level2 = (lo + loj) / 2
+                    if level2 < close
+                        has_ssl := true
+                        if na(nearest_eql) or math.abs(close - level2) < math.abs(close - nearest_eql)
+                            nearest_eql := level2
+
+// ============================================================================
+// STEP 4 — BIAS CALCULATION (Matches analyzer.py exactly)
+// ============================================================================
+long_score  = (is_discount ? 1 : 0) + (weekly_bullish ? 1 : 0) + (dist_to_pdh < dist_to_pdl ? 1 : 0) + (has_bsl ? 1 : 0)
+short_score = (is_premium  ? 1 : 0) + (weekly_bearish ? 1 : 0) + (dist_to_pdl < dist_to_pdh ? 1 : 0) + (has_ssl ? 1 : 0)
+
+// FINAL BIAS DECISION
+var string bias_text = "NEUTRAL"
+var color  bias_color = color.gray
+var float  target_level = na
+var string target_text = "N/A"
+var float  confidence = 0.0
+
+if barstate.islast
+    direction_long  = (long_score > short_score) and (long_score >= 2)
+    direction_short = (short_score > long_score) and (short_score >= 2)
+
+    if direction_long
+        bias_text := "LONG"
+        bias_color := color.green
+        target_level := pdh
+        target_text := "PDH"
+        confidence := long_score / 4.0
+    else if direction_short
+        bias_text := "SHORT"
+        bias_color := color.red
+        target_level := pdl
+        target_text := "PDL"
+        confidence := short_score / 4.0
+    else
+        bias_text := "NEUTRAL"
+        bias_color := color.gray
+        target_level := na
+        target_text := "N/A"
+        confidence := 0.0
+
+confidence_pct = math.round(confidence * 100)
+
+// ============================================================================
+// STEP 5 — KILL ZONES
+// ============================================================================
+hour_ny    = hour(time, "America/New_York")
+in_london  = hour_ny >= 2 and hour_ny < 5
+in_ny      = hour_ny >= 7 and hour_ny < 10
+in_kz      = in_london or in_ny
+kz_text    = in_london ? "LONDON" : in_ny ? "NEW YORK" : "CLOSED"
+
+// ============================================================================
+// DRAW — IPDA RANGE LEVELS
+// ============================================================================
+var line ipda_high_line = na
+var line ipda_mid_line  = na
+var line ipda_low_line  = na
+var label ipda_high_lbl = na
+var label ipda_mid_lbl  = na
+var label ipda_low_lbl  = na
+
+if barstate.islast and show_ipda
+    line.delete(ipda_high_line)
+    line.delete(ipda_mid_line)
+    line.delete(ipda_low_line)
+    label.delete(ipda_high_lbl)
+    label.delete(ipda_mid_lbl)
+    label.delete(ipda_low_lbl)
+
+    ipda_high_line := line.new(bar_index - 200, ipda_high, bar_index, ipda_high,
+         xloc=xloc.bar_index, color=color.new(color.orange, 30), width=1, style=line.style_dotted)
+    ipda_mid_line  := line.new(bar_index - 200, ipda_mid,  bar_index, ipda_mid,
+         xloc=xloc.bar_index, color=color.new(color.yellow, 30), width=1, style=line.style_dotted)
+    ipda_low_line  := line.new(bar_index - 200, ipda_low,  bar_index, ipda_low,
+         xloc=xloc.bar_index, color=color.new(color.orange, 30), width=1, style=line.style_dotted)
+
+    ipda_high_lbl := label.new(bar_index + 2, ipda_high,
+         text="IPDA High (" + str.tostring(ipda_days) + "D): " + str.tostring(ipda_high, "#.##"),
+         xloc=xloc.bar_index, yloc=yloc.price,
+         color=color.new(color.orange, 20), textcolor=color.white,
+         style=label.style_label_left, size=size.tiny)
+
+    ipda_mid_lbl := label.new(bar_index + 2, ipda_mid,
+         text="IPDA 50% (EQ): " + str.tostring(ipda_mid, "#.##") + " | " + (is_premium ? "PREMIUM" : "DISCOUNT"),
+         xloc=xloc.bar_index, yloc=yloc.price,
+         color=color.new(color.yellow, 20), textcolor=color.white,
+         style=label.style_label_left, size=size.tiny)
+
+    ipda_low_lbl := label.new(bar_index + 2, ipda_low,
+         text="IPDA Low (" + str.tostring(ipda_days) + "D): " + str.tostring(ipda_low, "#.##"),
+         xloc=xloc.bar_index, yloc=yloc.price,
+         color=color.new(color.orange, 20), textcolor=color.white,
+         style=label.style_label_left, size=size.tiny)
+
+// ============================================================================
+// DRAW — PDH / PDL LINES
+// ============================================================================
+var line pdh_line = na
+var line pdl_line = na
+var label pdh_lbl = na
+var label pdl_lbl = na
+
+if barstate.islast and show_pdh_pdl
+    line.delete(pdh_line)
+    line.delete(pdl_line)
+    label.delete(pdh_lbl)
+    label.delete(pdl_lbl)
+
+    pdh_line := line.new(bar_index - 200, pdh, bar_index + 2, pdh,
+         xloc=xloc.bar_index,
+         color=color.new(color.green, 20), width=2, style=line.style_solid)
+
+    pdl_line := line.new(bar_index - 200, pdl, bar_index + 2, pdl,
+         xloc=xloc.bar_index,
+         color=color.new(color.red, 20), width=2, style=line.style_solid)
+
+    pdh_lbl := label.new(bar_index + 3, pdh,
+         text="PDH: " + str.tostring(pdh, "#.###") + (bias_text == "LONG" ? "  TARGET" : ""),
+         xloc=xloc.bar_index, yloc=yloc.price,
+         color=color.new(bias_text == "LONG" ? color.green : color.gray, 20),
+         textcolor=color.white,
+         style=label.style_label_left, size=size.small)
+
+    pdl_lbl := label.new(bar_index + 3, pdl,
+         text="PDL: " + str.tostring(pdl, "#.###") + (bias_text == "SHORT" ? "  TARGET" : ""),
+         xloc=xloc.bar_index, yloc=yloc.price,
+         color=color.new(bias_text == "SHORT" ? color.red : color.gray, 20),
+         textcolor=color.white,
+         style=label.style_label_left, size=size.small)
+
+// ============================================================================
+// DRAW — BIAS BOX (grey = travelled, color = target)
+// ============================================================================
+var box grey_box  = na
+var box color_box = na
+
+if barstate.islast and not na(pdh)
+    box.delete(grey_box)
+    box.delete(color_box)
+
+    x1 = bar_index + 5
+    x2 = bar_index + 30
+
+    if bias_text == "LONG"
+        grey_box := box.new(x1, close, x2, pdl,
+             xloc=xloc.bar_index,
+             bgcolor=color.new(color.gray, 25),
+             border_color=color.new(color.gray, 10), border_width=1)
+        color_box := box.new(x1, pdh, x2, close,
+             xloc=xloc.bar_index,
+             bgcolor=color.new(color.green, 25),
+             border_color=color.new(color.green, 10), border_width=1)
+    else if bias_text == "SHORT"
+        grey_box := box.new(x1, pdh, x2, close,
+             xloc=xloc.bar_index,
+             bgcolor=color.new(color.gray, 25),
+             border_color=color.new(color.gray, 10), border_width=1)
+        color_box := box.new(x1, close, x2, pdl,
+             xloc=xloc.bar_index,
+             bgcolor=color.new(color.red, 25),
+             border_color=color.new(color.red, 10), border_width=1)
+    else
+        grey_box := box.new(x1, pdh, x2, pdl,
+             xloc=xloc.bar_index,
+             bgcolor=color.new(color.gray, 25),
+             border_color=color.new(color.gray, 10), border_width=1)
+        color_box := na
+
+// ============================================================================
+// KILL ZONE BACKGROUND
+// ============================================================================
+bgcolor(show_killzones and in_london ? color.new(color.blue,   90) : na, title="London KZ")
+bgcolor(show_killzones and in_ny     ? color.new(color.orange, 90) : na, title="NY KZ")
+
+// ============================================================================
+// INFO TABLE — Full Model 12 Prep Summary
+// ============================================================================
+var table t = na
+
+if barstate.islast and show_table
+    if na(t)
+        t := table.new(position.top_right, 2, 13, border_width=1)
+
+    // Header
+    table.cell(t, 0, 0,  "ICT MODEL 12",          bgcolor=color.navy,  text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 0,  "PDH/PDL",            bgcolor=color.navy,  text_color=color.white, text_size=size.normal)
+
+    // IPDA
+    table.cell(t, 0, 1,  "IPDA Range",             bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1,  str.tostring(ipda_low, "#.##") + " - " + str.tostring(ipda_high, "#.##"), bgcolor=color.gray, text_color=color.orange, text_size=size.small)
+    table.cell(t, 0, 2,  "Price Position",          bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2,  str.tostring(price_position, "#.#") + "% | " + (is_premium ? "PREMIUM" : "DISCOUNT"), bgcolor=color.gray, text_color=is_premium ? color.red : color.green, text_size=size.small)
+
+    // PDH / PDL
+    table.cell(t, 0, 3,  "PDH (Target)",           bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3,  str.tostring(pdh, "#.###"),bgcolor=color.gray,  text_color=color.green, text_size=size.small)
+    table.cell(t, 0, 4,  "PDL (Target)",           bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 4,  str.tostring(pdl, "#.###"),bgcolor=color.gray,  text_color=color.red,   text_size=size.small)
+
+    // Weekly Bias
+    table.cell(t, 0, 5,  "Weekly Bias",            bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 5,  weekly_bullish ? "BULLISH" : weekly_bearish ? "BEARISH" : "MIXED", bgcolor=color.gray, text_color=weekly_bullish ? color.green : weekly_bearish ? color.red : color.yellow, text_size=size.small)
+
+    // Liquidity (BSL / SSL)
+    table.cell(t, 0, 6,  "Liquidity (BSL/SSL)",    bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 6,  (has_bsl ? "BSL ✓" : "BSL ✗") + " | " + (has_ssl ? "SSL ✓" : "SSL ✗"), bgcolor=color.gray, text_color=color.aqua, text_size=size.small)
+
+    // Kill Zone
+    table.cell(t, 0, 7,  "Kill Zone",              bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 7,  kz_text, bgcolor=color.gray, text_color=in_kz ? color.green : color.red, text_size=size.small)
+
+    // Divider
+    table.cell(t, 0, 8,  "─────────",              bgcolor=color.navy,  text_color=color.navy,  text_size=size.small)
+    table.cell(t, 1, 8,  "─────────",              bgcolor=color.navy,  text_color=color.navy,  text_size=size.small)
+
+    // Final Bias
+    table.cell(t, 0, 9,  "BIAS",                   bgcolor=color.black, text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 9,  bias_text,                bgcolor=color.black, text_color=bias_color,  text_size=size.normal)
+
+    // Target
+    table.cell(t, 0, 10, "TARGET",                 bgcolor=color.black, text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 10, target_text + " @ " + str.tostring(target_level, "#.###"), bgcolor=color.black, text_color=bias_color, text_size=size.normal)
+
+    // Confidence
+    table.cell(t, 0, 11, "CONFIDENCE",             bgcolor=color.black, text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 11, str.tostring(confidence_pct) + "%", bgcolor=color.black, text_color=confidence_pct >= 50 ? color.green : color.orange, text_size=size.normal)
+
+    // Model 12 TP
+    table.cell(t, 0, 12, "Model 12 TP",            bgcolor=color.gray,  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 12, bias_text == "LONG" ? "+ $20.00" : bias_text == "SHORT" ? "- $20.00" : "N/A", bgcolor=color.gray, text_color=bias_color, text_size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(bias_text == "LONG"  and in_kz, "Model 12 LONG Setup",  "Model 12 LONG - Kill Zone Active - Target PDH")
+alertcondition(bias_text == "SHORT" and in_kz, "Model 12 SHORT Setup", "Model 12 SHORT - Kill Zone Active - Target PDL")
+alertcondition(in_london and not in_london[1], "London Kill Zone Open",   "LONDON KILL ZONE - Model 12 Watch")
+alertcondition(in_ny     and not in_ny[1],     "New York Kill Zone Open", "NEW YORK KILL ZONE - Model 12 Watch")
